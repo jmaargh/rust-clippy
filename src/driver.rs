@@ -21,11 +21,15 @@ use rustc_tools_util::VersionInfo;
 
 use std::borrow::Cow;
 use std::env;
+use std::fs;
+use std::io;
 use std::lazy::SyncLazy;
 use std::ops::Deref;
 use std::panic;
 use std::path::{Path, PathBuf};
 use std::process::{exit, Command};
+
+use serde::Deserialize;
 
 /// If a command-line option matches `find_arg`, then apply the predicate `pred` on its value. If
 /// true, then return it. The parameter is assumed to be either `--arg=value` or `--arg value`.
@@ -310,21 +314,32 @@ pub fn main() {
         };
 
         let mut no_deps = false;
+
+        // FIXME: heirarchy of config files
+        // FIXME: check for duplicates and conflicts
+        // FIXME: unwraps and error handling
+        let conf = lookup_lint_flags_file()
+            .unwrap()
+            .and_then(|p| ClippyLintFlagsConf::read(&p).ok())
+            .unwrap_or_default();
+        let mut clippy_args = conf.to_args();
+
         let clippy_args_var = env::var("CLIPPY_ARGS").ok();
-        let clippy_args = clippy_args_var
-            .as_deref()
-            .unwrap_or_default()
-            .split("__CLIPPY_HACKERY__")
-            .filter_map(|s| match s {
-                "" => None,
-                "--no-deps" => {
-                    no_deps = true;
-                    None
-                },
-                _ => Some(s.to_string()),
-            })
-            .chain(vec!["--cfg".into(), r#"feature="cargo-clippy""#.into()])
-            .collect::<Vec<String>>();
+        clippy_args.extend(
+            clippy_args_var
+                .as_deref()
+                .unwrap_or_default()
+                .split("__CLIPPY_HACKERY__")
+                .filter_map(|s| match s {
+                    "" => None,
+                    "--no-deps" => {
+                        no_deps = true;
+                        None
+                    },
+                    _ => Some(s.to_string()),
+                })
+                .chain(vec!["--cfg".into(), r#"feature="cargo-clippy""#.into()]),
+        );
 
         // We enable Clippy if one of the following conditions is met
         // - IF Clippy is run on its test suite OR
@@ -346,4 +361,77 @@ pub fn main() {
             rustc_driver::RunCompiler::new(&args, &mut RustcCallbacks { clippy_args_var }).run()
         }
     }))
+}
+
+#[derive(Deserialize, Default, Debug)]
+struct ClippyLintFlagsConf {
+    #[serde(rename = "allow", default)]
+    allow_lints: Vec<String>,
+    #[serde(rename = "warn", default)]
+    warn_lints: Vec<String>,
+    #[serde(rename = "deny", default)]
+    deny_lints: Vec<String>,
+    #[serde(rename = "forbid", default)]
+    forbid_lints: Vec<String>,
+}
+
+impl ClippyLintFlagsConf {
+    fn read(path: &Path) -> Result<Self, String> {
+        let contents = fs::read_to_string(path).map_err(|e| e.to_string())?;
+        toml::from_str(&contents).map_err(|e| e.to_string())
+    }
+
+    fn to_args(self) -> Vec<String> {
+        let mut out = Vec::with_capacity(
+            (self.allow_lints.len() + self.warn_lints.len() + self.deny_lints.len() + self.forbid_lints.len()) * 2,
+        );
+
+        for lint in self.allow_lints {
+            out.push("-A".into());
+            out.push(lint);
+        }
+        for lint in self.warn_lints {
+            out.push("-W".into());
+            out.push(lint);
+        }
+        for lint in self.deny_lints {
+            out.push("-D".into());
+            out.push(lint);
+        }
+        for lint in self.forbid_lints {
+            out.push("-F".into());
+            out.push(lint);
+        }
+
+        out
+    }
+}
+
+/// Search for the configuration file.
+fn lookup_lint_flags_file() -> io::Result<Option<PathBuf>> {
+    /// Possible filename to search for.
+    const CONFIG_FILE_NAMES: [&str; 2] = [".clippy-lints.toml", "clippy-lints.toml"];
+
+    // Start looking for a config file in CLIPPY_CONF_DIR, or failing that, CARGO_MANIFEST_DIR.
+    // If neither of those exist, use ".".
+    let mut current = env::var_os("CLIPPY_CONF_DIR")
+        .or_else(|| env::var_os("CARGO_MANIFEST_DIR"))
+        .map_or_else(|| PathBuf::from("."), PathBuf::from);
+    loop {
+        for config_file_name in &CONFIG_FILE_NAMES {
+            if let Ok(config_file) = current.join(config_file_name).canonicalize() {
+                match fs::metadata(&config_file) {
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => {},
+                    Err(e) => return Err(e),
+                    Ok(md) if md.is_dir() => {},
+                    Ok(_) => return Ok(Some(config_file)),
+                }
+            }
+        }
+
+        // If the current directory has no parent, we're done searching.
+        if !current.pop() {
+            return Ok(None);
+        }
+    }
 }
